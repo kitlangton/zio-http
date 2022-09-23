@@ -15,7 +15,17 @@ object Box {
 
   final case class Succeed[A](value: A) extends Box[A]
 
-  final case class Zip[A, B, C](lhs: Box[A], rhs: Box[B], zipper: Zipper.WithOut[A, B, C]) extends Box[C]
+  final case class Zip[A, B, C](lhs: Box[A], rhs: Box[B], zipper: Zipper.WithOut[A, B, C]) extends Box[C] {
+    def shouldOptimizeRight: Boolean = rhs match {
+      case Zip(_, _, rightZipper) => rightZipper.resultSize == zipper.rightSize
+      case _                      => true
+    }
+
+    def shouldOptimizeLeft: Boolean = lhs match {
+      case Zip(_, _, leftZipper) => leftZipper.resultSize == zipper.leftSize
+      case _                     => true
+    }
+  }
 
   final case class Map[A, B](box: Box[A], f: A => B) extends Box[B]
 
@@ -32,40 +42,42 @@ object Box {
     }
   }
 
-  private def makeZipper[A](zip: Zip[_, _, A]): Array[Any] => A =
-//    if (countNestedZips(box) <= 2) {
-    if (zip.zipper.leftSize == 1) {
-//    if (zip.zipper.isInstanceOf[ABZipper[_, _]]) {
-      // If there aren't enough nested zips, this optimization is not worth it,
-      // use the original implementation.
+  private def makeZipper[A](zip: Zip[_, _, A]): Array[Any] => A = {
+    if (!shouldOptimize(zip) || countNestedZips(zip) < 2) {
       zip match {
         case Zip(lhs, rhs, zipper) =>
-          val leftConstructor  = makeConstructor(lhs)
-          val rightConstructor = makeConstructor(rhs)
-          results => {
-            val leftValue  = leftConstructor(results)
-            val rightValue = rightConstructor(results)
-            zipper.combine(leftValue, rightValue)
-          }
+          val lhsCons = makeConstructor(lhs)
+          val rhsCons = makeConstructor(rhs)
+          results => zipper.combine(lhsCons(results), rhsCons(results))
       }
     } else {
       // If there 3 or more nested zips, we can optimize the zipper
-      val zipper = makeZipperImpl(zip, 0)
       val size   = zip.zipper.resultSize
-      println(s"size: $size for $zip")
-
+      val zipper = makeZipperImpl(zip, 0, size - 1)
       results => {
         val array: Array[Any] = Array.ofDim(size)
         zipper(results)(array)
         arrayToTuple[A](array, size)
       }
     }
+  }
 
-  private def makeZipperImpl(zip: Zip[_, _, _], start: Int): Array[Any] => Array[Any] => Unit =
+  private def makeZipperImpl(zip: Zip[_, _, _], start: Int, end: Int): Array[Any] => Array[Any] => Unit =
     zip match {
+      case Zip(lhs: Zip[_, _, _], rhs: Zip[_, _, _], zipper) if !shouldOptimize(zip) =>
+        val lhsConstructor = makeZipper(lhs)
+        val rhsConstructor = makeZipper(rhs)
+        results =>
+          builder => {
+            val lhsResult = lhsConstructor(results)
+            val rhsResult = rhsConstructor(results)
+            zipper.spreadLeft(lhsResult, builder, start)
+            zipper.spreadRight(rhsResult, builder, start + zipper.leftSize)
+          }
+
       case Zip(lhs: Zip[_, _, _], rhs: Zip[_, _, _], zipper) =>
-        val zipper1 = makeZipperImpl(lhs, start)
-        val zipper2 = makeZipperImpl(rhs, start + zipper.leftSize)
+        val zipper1 = makeZipperImpl(lhs, start, zipper.leftSize)
+        val zipper2 = makeZipperImpl(rhs, start + zipper.leftSize, end)
 
         results =>
           builder => {
@@ -75,7 +87,7 @@ object Box {
 
       case Zip(lhs, rhs: Zip[_, _, _], zipper) =>
         val lhsConstructor = makeConstructor(lhs)
-        val rhsZipper      = makeZipperImpl(rhs, start + zipper.leftSize)
+        val rhsZipper      = makeZipperImpl(rhs, start + zipper.leftSize, end)
 
         results =>
           builder => {
@@ -85,7 +97,7 @@ object Box {
           }
 
       case Zip(lhs: Zip[_, _, _], rhs, zipper) =>
-        val lhsZipper      = makeZipperImpl(lhs, start)
+        val lhsZipper      = makeZipperImpl(lhs, start, end)
         val rhsConstructor = makeConstructor(rhs)
 
         results =>
@@ -113,22 +125,42 @@ object Box {
 
   private def countNestedZips(box: Box[_]): Int =
     box match {
-      case Zip(left, right, _) => 1 + countNestedZips(left) + countNestedZips(right)
-      case Map(_, _)           => 0
-      case Succeed(_)          => 0
+      case zip @ Zip(left, right, _) =>
+        val leftZips  = if (zip.shouldOptimizeLeft) countNestedZips(left) else 0
+        val rightZips = if (zip.shouldOptimizeRight) countNestedZips(right) else 0
+        1 + leftZips + rightZips
+      case Map(_, _)                 => 0
+      case Succeed(_)                => 0
     }
 
-  private def arrayToTuple[A](array: Array[Any], size: Int): A = {
-    println(s"Converting array ${array.toList} to tuple of size $size")
+  // only optimize if the resultSize of the nested zipper on either side is of the expected size
+  def shouldOptimize(zip: Zip[_, _, _]): Boolean = {
+    zip match {
+      case Zip(left: Zip[_, _, _], right: Zip[_, _, _], zipper) =>
+        left.zipper.resultSize == zipper.leftSize && right.zipper.resultSize == zipper.rightSize
+      case Zip(left: Zip[_, _, _], _, zipper)                   =>
+        left.zipper.resultSize == zipper.leftSize
+      case Zip(_, right: Zip[_, _, _], zipper)                  =>
+        right.zipper.resultSize == zipper.rightSize
+      case _                                                    => true
+    }
+  }
+
+  private def arrayToTuple[A](as: Array[Any], size: Int): A = {
+    println(s"Converting array ${as.toList} to tuple of size $size")
     size match {
-      case 1 => array(0).asInstanceOf[A]
-      case 2 => (array(0), array(1)).asInstanceOf[A]
-      case 3 => (array(0), array(1), array(2)).asInstanceOf[A]
-      case 4 => (array(0), array(1), array(2), array(3)).asInstanceOf[A]
-      case 5 => (array(0), array(1), array(2), array(3), array(4)).asInstanceOf[A]
-      case 6 => (array(0), array(1), array(2), array(3), array(4), array(5)).asInstanceOf[A]
-      case 7 => (array(0), array(1), array(2), array(3), array(4), array(5), array(6)).asInstanceOf[A]
-      case 8 => (array(0), array(1), array(2), array(3), array(4), array(5), array(6), array(7)).asInstanceOf[A]
+      case 1  => as(0).asInstanceOf[A]
+      case 2  => (as(0), as(1)).asInstanceOf[A]
+      case 3  => (as(0), as(1), as(2)).asInstanceOf[A]
+      case 4  => (as(0), as(1), as(2), as(3)).asInstanceOf[A]
+      case 5  => (as(0), as(1), as(2), as(3), as(4)).asInstanceOf[A]
+      case 6  => (as(0), as(1), as(2), as(3), as(4), as(5)).asInstanceOf[A]
+      case 7  => (as(0), as(1), as(2), as(3), as(4), as(5), as(6)).asInstanceOf[A]
+      case 8  => (as(0), as(1), as(2), as(3), as(4), as(5), as(6), as(7)).asInstanceOf[A]
+      case 9  => (as(0), as(1), as(2), as(3), as(4), as(5), as(6), as(7), as(8)).asInstanceOf[A]
+      case 10 => (as(0), as(1), as(2), as(3), as(4), as(5), as(6), as(7), as(8), as(9)).asInstanceOf[A]
+      case 11 => (as(0), as(1), as(2), as(3), as(4), as(5), as(6), as(7), as(8), as(9), as(10)).asInstanceOf[A]
+      case 12 => (as(0), as(1), as(2), as(3), as(4), as(5), as(6), as(7), as(8), as(9), as(10), as(11)).asInstanceOf[A]
     }
   }
 }
@@ -146,7 +178,10 @@ object BoxExample extends App {
   val example3: Box[((Int, Unit, Double, Boolean, String), (Double, Int, Int))] =
     example zip example2
 
-  val constructor = Box.makeConstructor(example3)
+  val example4: Box[(Int, Int, (Double, Int, Int), Int, Int)] =
+    Box.Succeed(()) zip Box.succeed((10, 20)) zip example2 zip Box.succeed(4) zip Box.succeed(()) zip Box.succeed(5)
+
+  val constructor = Box.makeConstructor(example4)
   val result      = constructor(Array())
   println(result)
 }
@@ -167,74 +202,76 @@ sealed trait Zipper[A, B] extends Product with Serializable {
 object Zipper extends LowPriorityZipper1 {
   type WithOut[A, B, Out0] = Zipper[A, B] { type Out = Out0 }
 
-  final case class Zipper2[A, B, C]() extends Zipper[(A, B), C] {
-    type Out = (A, B, C)
+  implicit def leftUnitZipper[A]: Zipper.WithOut[Unit, A, A]  = LowPriorityZipper1.LeftUnitZipper[A]()
+  implicit def rightUnitZipper[A]: Zipper.WithOut[A, Unit, A] = LowPriorityZipper1.RightUnitZipper[A]()
 
-    override def combine(a: (A, B), b: C): (A, B, C) = (a._1, a._2, b)
-
-    override def leftSize: Int  = 2
-    override def rightSize: Int = 1
-
-    override def spreadLeft(value: (A, B), array: Array[Any], start: Int): Unit = {
-      array(start) = value._1
-      array(start + 1) = value._2
-    }
-
-    override def spreadRight(value: C, array: Array[Any], start: Int): Unit = {
-      array(start) = value
-    }
-
-  }
-
-  implicit def zipper2[A, B, C]: Zipper.WithOut[(A, B), C, (A, B, C)] = Zipper2()
-
-  final case class Zipper3[A, B, C, D]() extends Zipper[(A, B, C), D] {
-    type Out = (A, B, C, D)
-
-    override def combine(a: (A, B, C), b: D): (A, B, C, D) = (a._1, a._2, a._3, b)
-
-    override def leftSize: Int  = 3
-    override def rightSize: Int = 1
-
-    override def spreadLeft(value: (A, B, C), array: Array[Any], start: Int): Unit = {
-      array(start) = value._1
-      array(start + 1) = value._2
-      array(start + 2) = value._3
-    }
-
-    override def spreadRight(value: D, array: Array[Any], start: Int): Unit = {
-      array(start) = value
-    }
-  }
-
-  implicit def zipper3[A, B, C, D]: Zipper.WithOut[(A, B, C), D, (A, B, C, D)] = Zipper3()
-
-  final case class Zipper4[A, B, C, D, E]() extends Zipper[(A, B, C, D), E] {
-    type Out = (A, B, C, D, E)
-
-    override def combine(a: (A, B, C, D), b: E): (A, B, C, D, E) = (a._1, a._2, a._3, a._4, b)
-
-    override def leftSize: Int  = 4
-    override def rightSize: Int = 1
-
-    override def spreadLeft(value: (A, B, C, D), array: Array[Any], start: Int): Unit = {
-      array(start) = value._1
-      array(start + 1) = value._2
-      array(start + 2) = value._3
-      array(start + 3) = value._4
-    }
-
-    override def spreadRight(value: E, array: Array[Any], start: Int): Unit = {
-      array(start) = value
-    }
-  }
-
-  implicit def zipper4[A, B, C, D, E]: Zipper.WithOut[(A, B, C, D), E, (A, B, C, D, E)] = Zipper4()
 }
 
 trait LowPriorityZipper1 extends LowPriorityZipper0 {
-  implicit def leftUnitZipper[A]: Zipper.WithOut[Unit, A, A]  = LowPriorityZipper1.LeftUnitZipper[A]()
-  implicit def rightUnitZipper[A]: Zipper.WithOut[A, Unit, A] = LowPriorityZipper1.RightUnitZipper[A]()
+  implicit def zipper2[A, B, C]: Zipper.WithOut[(A, B), C, (A, B, C)]                   = Zipper2()
+  implicit def zipper3[A, B, C, D]: Zipper.WithOut[(A, B, C), D, (A, B, C, D)]          = Zipper3()
+  implicit def zipper4[A, B, C, D, E]: Zipper.WithOut[(A, B, C, D), E, (A, B, C, D, E)] = Zipper4()
+}
+
+final case class Zipper2[A, B, C]() extends Zipper[(A, B), C] {
+  type Out = (A, B, C)
+
+  override def combine(a: (A, B), b: C): (A, B, C) = (a._1, a._2, b)
+
+  override def leftSize: Int = 2
+
+  override def rightSize: Int = 1
+
+  override def spreadLeft(value: (A, B), array: Array[Any], start: Int): Unit = {
+    array(start) = value._1
+    array(start + 1) = value._2
+  }
+
+  override def spreadRight(value: C, array: Array[Any], start: Int): Unit = {
+    array(start) = value
+  }
+
+}
+
+final case class Zipper3[A, B, C, D]() extends Zipper[(A, B, C), D] {
+  type Out = (A, B, C, D)
+
+  override def combine(a: (A, B, C), b: D): (A, B, C, D) = (a._1, a._2, a._3, b)
+
+  override def leftSize: Int = 3
+
+  override def rightSize: Int = 1
+
+  override def spreadLeft(value: (A, B, C), array: Array[Any], start: Int): Unit = {
+    array(start) = value._1
+    array(start + 1) = value._2
+    array(start + 2) = value._3
+  }
+
+  override def spreadRight(value: D, array: Array[Any], start: Int): Unit = {
+    array(start) = value
+  }
+}
+
+final case class Zipper4[A, B, C, D, E]() extends Zipper[(A, B, C, D), E] {
+  type Out = (A, B, C, D, E)
+
+  override def combine(a: (A, B, C, D), b: E): (A, B, C, D, E) = (a._1, a._2, a._3, a._4, b)
+
+  override def leftSize: Int = 4
+
+  override def rightSize: Int = 1
+
+  override def spreadLeft(value: (A, B, C, D), array: Array[Any], start: Int): Unit = {
+    array(start) = value._1
+    array(start + 1) = value._2
+    array(start + 2) = value._3
+    array(start + 3) = value._4
+  }
+
+  override def spreadRight(value: E, array: Array[Any], start: Int): Unit = {
+    array(start) = value
+  }
 }
 
 object LowPriorityZipper1 {
