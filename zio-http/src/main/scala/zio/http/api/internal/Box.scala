@@ -29,15 +29,20 @@ object Box {
 
   final case class Map[A, B](box: Box[A], f: A => B) extends Box[B]
 
-  def makeConstructor[A](box: Box[A]): Array[Any] => A = {
+  def makeConstructor[A](box: Box[A], optimizeZip: Boolean = true): Array[Any] => A = {
     box match {
       case Succeed(value) => _ => value
 
-      case zip @ Zip(_, _, _) =>
+      case zip @ Zip(_, _, _) if optimizeZip =>
         makeZipper(zip)
 
+      case Zip(lhs, rhs, zipper) =>
+        val lhsCons = makeConstructor(lhs, optimizeZip)
+        val rhsCons = makeConstructor(rhs, optimizeZip)
+        results => zipper.combine(lhsCons(results), rhsCons(results))
+
       case Map(box, f) =>
-        val constructor = makeConstructor(box)
+        val constructor = makeConstructor(box, optimizeZip)
         args => f(constructor(args))
     }
   }
@@ -115,9 +120,9 @@ object Box {
           builder => {
             val lhsResult = lhsConstructor(results)
             val rhsResult = rhsConstructor(results)
-            println(s"Zipping $lhsResult and $rhsResult")
-            println(s"Zipper: ${zipper.leftSize} and ${zipper.rightSize}")
-            println(s"Builder size ${builder.length}")
+//            println(s"Zipping $lhsResult and $rhsResult")
+//            println(s"Zipper: ${zipper.leftSize} and ${zipper.rightSize}")
+//            println(s"Builder size ${builder.length}")
             zipper.spreadLeft(lhsResult, builder, start)
             zipper.spreadRight(rhsResult, builder, start + zipper.leftSize)
           }
@@ -147,7 +152,7 @@ object Box {
   }
 
   private def arrayToTuple[A](as: Array[Any], size: Int): A = {
-    println(s"Converting array ${as.toList} to tuple of size $size")
+//    println(s"Converting array ${as.toList} to tuple of size $size")
     size match {
       case 1  => as(0).asInstanceOf[A]
       case 2  => (as(0), as(1)).asInstanceOf[A]
@@ -175,13 +180,13 @@ object BoxExample extends App {
   val example2: Box[(Double, Int, Int)] =
     Box.succeed(2.0) zip Box.succeed(2) zip Box.succeed(3)
 
-  val example3: Box[((Int, Unit, Double, Boolean, String), (Double, Int, Int))] =
+  val example3: Box[(Int, Unit, Double, Boolean, String, (Double, Int, Int))] =
     example zip example2
 
   val example4: Box[(Int, Int, (Double, Int, Int), Int, Int)] =
     Box.Succeed(()) zip Box.succeed((10, 20)) zip example2 zip Box.succeed(4) zip Box.succeed(()) zip Box.succeed(5)
 
-  val constructor = Box.makeConstructor(example4)
+  val constructor = Box.makeConstructor(example4, false)
   val result      = constructor(Array())
   println(result)
 }
@@ -208,9 +213,11 @@ object Zipper extends LowPriorityZipper1 {
 }
 
 trait LowPriorityZipper1 extends LowPriorityZipper0 {
-  implicit def zipper2[A, B, C]: Zipper.WithOut[(A, B), C, (A, B, C)]                   = Zipper2()
-  implicit def zipper3[A, B, C, D]: Zipper.WithOut[(A, B, C), D, (A, B, C, D)]          = Zipper3()
-  implicit def zipper4[A, B, C, D, E]: Zipper.WithOut[(A, B, C, D), E, (A, B, C, D, E)] = Zipper4()
+  implicit def zipper2[A, B, C]: Zipper.WithOut[(A, B), C, (A, B, C)]                                     = Zipper2()
+  implicit def zipper3[A, B, C, D]: Zipper.WithOut[(A, B, C), D, (A, B, C, D)]                            = Zipper3()
+  implicit def zipper4[A, B, C, D, E]: Zipper.WithOut[(A, B, C, D), E, (A, B, C, D, E)]                   = Zipper4()
+  implicit def zipper5[A, B, C, D, E, F]: Zipper.WithOut[(A, B, C, D, E), F, (A, B, C, D, E, F)]          = Zipper5()
+  implicit def zipper6[A, B, C, D, E, F, G]: Zipper.WithOut[(A, B, C, D, E, F), G, (A, B, C, D, E, F, G)] = Zipper6()
 }
 
 final case class Zipper2[A, B, C]() extends Zipper[(A, B), C] {
@@ -270,6 +277,51 @@ final case class Zipper4[A, B, C, D, E]() extends Zipper[(A, B, C, D), E] {
   }
 
   override def spreadRight(value: E, array: Array[Any], start: Int): Unit = {
+    array(start) = value
+  }
+}
+
+final case class Zipper5[A, B, C, D, E, F]() extends Zipper[(A, B, C, D, E), F] {
+  type Out = (A, B, C, D, E, F)
+
+  override def combine(a: (A, B, C, D, E), b: F): (A, B, C, D, E, F) = (a._1, a._2, a._3, a._4, a._5, b)
+
+  override def leftSize: Int = 5
+
+  override def rightSize: Int = 1
+
+  override def spreadLeft(value: (A, B, C, D, E), array: Array[Any], start: Int): Unit = {
+    array(start) = value._1
+    array(start + 1) = value._2
+    array(start + 2) = value._3
+    array(start + 3) = value._4
+    array(start + 4) = value._5
+  }
+
+  override def spreadRight(value: F, array: Array[Any], start: Int): Unit = {
+    array(start) = value
+  }
+}
+
+final case class Zipper6[A, B, C, D, E, F, G]() extends Zipper[(A, B, C, D, E, F), G] {
+  type Out = (A, B, C, D, E, F, G)
+
+  override def combine(a: (A, B, C, D, E, F), b: G): (A, B, C, D, E, F, G) = (a._1, a._2, a._3, a._4, a._5, a._6, b)
+
+  override def leftSize: Int = 6
+
+  override def rightSize: Int = 1
+
+  override def spreadLeft(value: (A, B, C, D, E, F), array: Array[Any], start: Int): Unit = {
+    array(start) = value._1
+    array(start + 1) = value._2
+    array(start + 2) = value._3
+    array(start + 3) = value._4
+    array(start + 4) = value._5
+    array(start + 5) = value._6
+  }
+
+  override def spreadRight(value: G, array: Array[Any], start: Int): Unit = {
     array(start) = value
   }
 }
